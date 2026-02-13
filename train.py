@@ -12,6 +12,7 @@ import warnings
 import argparse
 import sys
 import monitor
+import datetime
 from dataclasses import dataclass
 from typing import Optional
 import math
@@ -115,7 +116,8 @@ def setup_distributed():
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
         assert torch.cuda.is_available(), "CUDA is required for distributed data training"
-        init_process_group(backend='nccl')
+        # Increase timeout to 3 hours to allow for long fine-tuning steps on rank 0
+        init_process_group(backend='nccl', timeout=datetime.timedelta(hours=3))
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])

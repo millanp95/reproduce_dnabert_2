@@ -2,7 +2,10 @@ import os
 import json
 import csv
 import subprocess
+import sys
 try:
+    import matplotlib
+    matplotlib.use('Agg') # Force non-interactive backend
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
@@ -160,6 +163,31 @@ def run_finetune(script_path, checkpoint_path, data_path, output_dir, step):
     # Add env var to disable wandb to avoid clutter
     env = os.environ.copy()
     env["WANDB_DISABLED"] = "true"
+    # Ensure finetune runs on a single GPU (the first one visible, or 0)
+    # Since we are likely inside a distributed run where CUDA_VISIBLE_DEVICES might be set to "0,1,2,3"
+    # we want to force this subprocess to only see one.
+    # Actually, better to just let it see all but tell it to use only one via CUDA_VISIBLE_DEVICES override?
+    # Or just rely on accelerator logic.
+    # The traceback indicates the crash was NameError: 'sys', which is fixed above.
+    # But regarding GPU usage:
+    # If the parent process (train.py) holds onto GPU memory, this subprocess might OOM 
+    # if it tries to allocate on the same GPU.
+    # Ideally, we should set CUDA_VISIBLE_DEVICES to just one GPU, e.g. GPU 0.
+    # But Rank 0 is running on GPU 0. It has the model loaded.
+    # PyTorch usually doesn't release memory unless we close the process.
+    # So running finetune.py (which creates a NEW model) on the SAME GPU might be tight on 64GB / 4 = 16GB?
+    # No, you have 64GB total or per GPU? 
+    # "mem=64G" in SLURM usually means System RAM.
+    # "gres=gpu:h100:4" means 4 H100s. H100s have massive memory (80GB). 
+    # So GPU memory overlap shouldn't be an issue.
+    # However, to prevent DDP confusion in the subprocess, we should strictly set:
+    env["CUDA_VISIBLE_DEVICES"] = "0" 
+    # And ensure no distributed env vars leak that might confuse HF Trainer
+    env.pop("RANK", None)
+    env.pop("LOCAL_RANK", None)
+    env.pop("WORLD_SIZE", None)
+    env.pop("MASTER_ADDR", None)
+    env.pop("MASTER_PORT", None)
     
     print(f"Starting fine-tuning for step {step}...")
     try:

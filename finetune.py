@@ -23,6 +23,7 @@ from peft import (
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    tokenizer_name: Optional[str] = field(default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"})
     use_lora: bool = field(default=False, metadata={"help": "whether to use LoRA"})
     lora_r: int = field(default=8, metadata={"help": "hidden dimension for LoRA"})
     lora_alpha: int = field(default=32, metadata={"help": "alpha for LoRA"})
@@ -233,9 +234,13 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Determine tokenizer path    
+    tokenizer_path = "zhihan1996/DNABERT-2-117M"
+    print(f"The tokenizer is: {tokenizer_path}")
+
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
+        tokenizer_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
@@ -261,6 +266,7 @@ def train():
 
     # load model
     if os.path.exists(model_args.model_name_or_path):
+        print("The model exists! ")
         if os.path.isdir(model_args.model_name_or_path):
             try:
                 model = BertForSequenceClassification.from_pretrained(
@@ -289,7 +295,7 @@ def train():
                 model = BertForSequenceClassification(config)
         else:
             # Assuming it is a checkpoint from train.py
-            logging.info(f"Loading from local checkpoint: {model_args.model_name_or_path}")
+            print(f"Loading from local checkpoint: {model_args.model_name_or_path}")
             checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
             if "config" in checkpoint:
                 config = transformers.BertConfig.from_dict(checkpoint["config"])
@@ -317,17 +323,14 @@ def train():
             logging.info(f"Model loaded. Missing keys: {keys.missing_keys}. Unexpected keys: {keys.unexpected_keys}")
             
     else:
-        logging.info("Model path not found, creating from scratch")
-        config = transformers.BertConfig(
-            vocab_size=4096,
-            hidden_size=768,
-            num_hidden_layers=12,
-            num_attention_heads=12,
-            max_position_embeddings=512,
-            alibi_starting_size=512,
-            num_labels=train_dataset.num_labels
+        print("Model path not found, downloading from HF")
+        # load model
+        model = transformers.AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            num_labels=train_dataset.num_labels,
+            trust_remote_code=True,
         )
-        model = BertForSequenceClassification(config)
 
     # configure LoRA
     if model_args.use_lora:
