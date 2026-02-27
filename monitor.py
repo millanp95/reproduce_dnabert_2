@@ -130,23 +130,24 @@ def plot_curves(log_path, history_path, output_dir):
     plt.close()
     print(f"Updated plots at {plot_path}")
 
-def run_finetune(script_path, checkpoint_path, data_path, output_dir, step):
+def run_finetune(script_path, checkpoint_path, data_path, output_dir, step, model_type="bert"):
     finetune_out = os.path.join(output_dir, f"finetune_step_{step}")
     run_name = f"run_step_{step}"
     
     cmd = [
         sys.executable, script_path,
         "--model_name_or_path", checkpoint_path,
+        "--model_type", model_type,
         "--data_path", data_path,
         "--output_dir", finetune_out,
         "--run_name", run_name,
         "--kmer", "-1",
-        "--model_max_length", "80",
+        "--model_max_length", "128",
         "--per_device_train_batch_size", "8",
         "--per_device_eval_batch_size", "16",
         "--gradient_accumulation_steps", "1",
         "--learning_rate", "3e-5",
-        "--num_train_epochs", "5",
+        "--num_train_epochs", "3",
         "--fp16", # Flag
         "--save_steps", "200",
         "--evaluation_strategy", "steps",
