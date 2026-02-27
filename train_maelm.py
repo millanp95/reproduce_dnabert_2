@@ -1,14 +1,17 @@
+import io
 import os
 import time
 import math
 import argparse
 import random
+import glob
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import webdataset as wds
 import numpy as np
-import monitor # Assuming monitor.py is available
+import warnings
+import monitor
 from transformers import AutoTokenizer, BertConfig, get_cosine_schedule_with_warmup
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -18,6 +21,111 @@ try:
 except ImportError:
     print("Warning: maelm_model.py not found. Please ensure the file exists.")
     MAELMModel = None
+
+def get_num_cpu_available():
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        warnings.warn("Unable to determine number of available CPUs. Falling back to os.cpu_count().")
+        return os.cpu_count()
+
+def npy_decoder(data: bytes) -> torch.Tensor:
+    return torch.from_numpy(np.load(io.BytesIO(data), allow_pickle=False))
+
+def make_dataset(pattern: str, shuffle_buf: int = 10_000, resampled: bool = False, world_size: int = 1, rank: int = 0):
+    # Create WebDataset with proper nodesplitter for distributed training
+    if world_size > 1:
+        # Use explicit nodesplitter for multi-GPU/multi-node training
+        ds = wds.WebDataset(
+            pattern, 
+            resampled=resampled,
+            nodesplitter=wds.shardlists.split_by_node
+        )
+    else:
+        # Single GPU training
+        ds = wds.WebDataset(pattern, resampled=resampled, shardshuffle=True)
+    
+    # Add epoch and length for continuous training
+    if resampled:
+        ds = ds.with_epoch(1000000)  # Large epoch size for continuous training
+        ds = ds.with_length(1000000)  # Ensure dataset has sufficient length
+    
+    # Shuffle and decode
+    ds = ds.shuffle(shuffle_buf)  # shuffle *within* the streaming buffer
+    ds = ds.to_tuple("__key__", "tokens", "attention_mask").map_tuple(lambda x:x, npy_decoder, npy_decoder)
+    return ds
+
+def setup_data_loaders(batch_size, total_train_batch_size, train_shards_pattern, world_size, rank, device):
+    """Setup training data loader matching train.py logic"""
+    assert total_train_batch_size % (batch_size * world_size) == 0
+    grad_accum_steps = total_train_batch_size // (batch_size * world_size)
+    
+    if rank == 0:
+        print(f"total desired batch size: {total_train_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    
+    # Setup datasets
+    train_dataset_patterns = sorted(glob.glob(train_shards_pattern))
+    if not train_dataset_patterns: 
+        train_dataset_patterns = train_shards_pattern 
+        
+    train_dataset = make_dataset(train_dataset_patterns, 10000, resampled=True, 
+                                world_size=world_size, rank=rank)
+    
+    # Use WebLoader for WebDataset
+    cpu_workers = get_num_cpu_available()
+    cpu_workers = min(cpu_workers, 4)
+    
+    if world_size > 1:
+        # For distributed training, use WebLoader
+        dataloader_train = iter(wds.WebLoader(
+            train_dataset.batched(batch_size, partial=False),
+            num_workers=cpu_workers,
+            batch_size=None 
+        ))
+    else:
+        # Single GPU can still use regular DataLoader
+        dl_train_kwargs = {
+            "batch_size": batch_size,
+            "drop_last": True,
+            "sampler": None,
+            "shuffle": False,
+            "num_workers": cpu_workers,
+            "pin_memory": device.type != "cpu"
+        }
+        dataloader_train = iter(torch.utils.data.DataLoader(train_dataset, **dl_train_kwargs))
+    
+    return dataloader_train, grad_accum_steps
+
+def process_batch_mlm(batch, tokenizer, mask_ratio=0.15):
+    """
+    Process batch for masked language modeling.
+    """
+    _, input_ids, att_mask = batch
+    
+    # Ensure they are tensors
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.as_tensor(input_ids)
+    if not isinstance(att_mask, torch.Tensor):
+        att_mask = torch.as_tensor(att_mask)
+        
+    targets = input_ids.long()
+    att_mask = att_mask.to(dtype=torch.float32)
+    
+    # 5 special tokens: CLS, PAD, SEP, UNK, MASK
+    num_special_tokens = 5 
+    mask_token_id = int(tokenizer.mask_token_id) if tokenizer.mask_token_id is not None else 4
+    
+    valid_token_mask = targets > num_special_tokens
+    random_mask = torch.rand(targets.shape)
+    input_maskout = random_mask < mask_ratio
+    input_maskout &= valid_token_mask 
+    
+    masked_input = targets.detach().clone()
+    masked_input.masked_fill_(input_maskout, mask_token_id)
+    att_mask.masked_fill_(input_maskout, 0.0) 
+    
+    return masked_input, att_mask, targets
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train MAELM Model")
@@ -63,43 +171,6 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def get_dataloader(pattern, batch_size, is_train=True):
-    dataset = wds.WebDataset(pattern, resampled=is_train, shardshuffle=is_train)
-    if is_train:
-        dataset = dataset.shuffle(1000)
-    dataset = dataset.decode() # Assuming safe
-    dataset = dataset.to_tuple("input_ids.npy", "attention_mask.npy")
-    dataset = dataset.batched(batch_size)
-    loader = wds.WebLoader(dataset, batch_size=None, num_workers=4)
-    if is_train:
-        loader = loader.unbatched().shuffle(1000).batched(batch_size)
-    return loader
-
-def process_batch_mlm(input_ids, attention_mask, tokenizer, mask_ratio=0.15):
-    labels = input_ids.clone()
-    probability_matrix = torch.full(labels.shape, mask_ratio)
-    
-    special_tokens_mask = torch.zeros_like(labels, dtype=torch.bool)
-    if tokenizer.pad_token_id is not None:
-        special_tokens_mask |= (labels == tokenizer.pad_token_id)
-    if tokenizer.cls_token_id is not None:
-        special_tokens_mask |= (labels == tokenizer.cls_token_id)
-    if tokenizer.sep_token_id is not None:
-        special_tokens_mask |= (labels == tokenizer.sep_token_id)
-        
-    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = -100 
-
-    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-    input_ids[indices_replaced] = tokenizer.mask_token_id
-
-    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
-    input_ids[indices_random] = random_words[indices_random]
-    
-    return input_ids, labels
-
 def save_checkpoint(model, optimizer, step, args, rank):
     if rank != 0: return
     
@@ -111,7 +182,10 @@ def save_checkpoint(model, optimizer, step, args, rank):
     torch.save(model_to_save.state_dict(), os.path.join(step_dir, "pytorch_model.bin"))
     
     # Save Config
-    model_to_save.encoder.config.save_pretrained(step_dir)
+    if hasattr(model_to_save, "encoder") and hasattr(model_to_save.encoder, "config"):
+         model_to_save.encoder.config.save_pretrained(step_dir)
+    elif hasattr(model_to_save, "config"):
+         model_to_save.config.save_pretrained(step_dir)
 
     # Save Optimizer & Args (for Resuming)
     train_state = {
@@ -137,12 +211,19 @@ def main():
     else:
         device = torch.device("cpu")
 
-    acc_steps = max(1, args.total_batch_size // (args.batch_size * world_size))
-
     if rank == 0:
-        print(f"MAELM Training | Batch: {args.total_batch_size} | Accum: {acc_steps} | Finetune: {args.finetune_data_path}")
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         os.makedirs(args.log_dir, exist_ok=True)
+
+    # Data Loading
+    train_loader, acc_steps = setup_data_loaders(
+        args.batch_size, 
+        args.total_batch_size, 
+        args.train_shards_pattern, 
+        world_size, 
+        rank, 
+        device
+    )
 
     tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
 
@@ -154,9 +235,11 @@ def main():
         "intermediate_size": 3072,
         "max_position_embeddings": args.max_seq_length,
         "type_vocab_size": 2, 
-        "_name_or_path": "zhihan1996/DNABERT-2-117M"
+        "_name_or_path": "zhihan1996/DNABERT-2-117M",
+        "alibi_starting_size": args.alibi_starting_size,
     })
 
+    print("Initializing MAELMModel...")
     model = MAELMModel(config, config) 
     model.to(device)
 
@@ -168,84 +251,90 @@ def main():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
     )
 
-    try:
-        dataloader = get_dataloader(args.train_shards_pattern, args.batch_size, is_train=True)
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return
-
     model.train()
     step = 0
     start_time = time.time()
     optimizer.zero_grad()
 
     try:
-        for i, batch in enumerate(dataloader):
-            step += 1
+        if rank == 0:
+            print(f"MAELM Training | Steps: {args.max_steps} | Accum: {acc_steps}")
+
+        for step in range(0, args.max_steps):
+            loss_accum = 0.0
             
-            if isinstance(batch, (tuple, list)):
-                input_ids, attention_mask = batch[0], batch[1]
-            elif isinstance(batch, dict):
-                input_ids = batch.get('input_ids.npy', batch.get('input_ids'))
-                attention_mask = batch.get('attention_mask.npy', batch.get('attention_mask'))
+            for micro_step in range(acc_steps):
+                try:
+                    batch = next(train_loader)
+                except StopIteration:
+                    if rank == 0:
+                        print("DataLoader exhausted, recreating...")
+                    # Recreate loader
+                    train_loader, _ = setup_data_loaders(
+                        args.batch_size, args.total_batch_size, args.train_shards_pattern, world_size, rank, device
+                    )
+                    batch = next(train_loader)
+                
+                input_ids, attention_mask, targets = process_batch_mlm(batch, tokenizer, args.mask_ratio)
+                
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                targets = targets.to(device)
+                
+                if world_size > 1:
+                    model.require_backward_grad_sync = (micro_step == acc_steps - 1)
+
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
+                
+                loss = outputs.loss if hasattr(outputs, 'loss') else (outputs[0] if isinstance(outputs, (tuple, list)) else outputs)
+                loss = loss / acc_steps
+                loss_accum += loss.detach()
+                loss.backward()
             
-            input_ids = torch.as_tensor(input_ids).long().to(device)
-            attention_mask = torch.as_tensor(attention_mask).long().to(device)
-            
-            input_ids, labels = process_batch_mlm(input_ids, attention_mask, tokenizer, args.mask_ratio)
-            labels = labels.to(device)
-            
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            
-            loss = outputs.loss if hasattr(outputs, 'loss') else (outputs[0] if isinstance(outputs, (tuple, list)) else outputs)
-            loss = loss / acc_steps
-            loss.backward()
-            
-            if step % acc_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            if world_size > 1:
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+                
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
                 
             if step % 100 == 0 and rank == 0:
                 elapsed = time.time() - start_time
                 if elapsed == 0: elapsed = 1e-5
-                tok_per_sec = (args.total_batch_size * args.max_seq_length * 100) / elapsed
+                seq_per_sec = (args.total_batch_size * args.max_seq_length) / elapsed # Using max_seq_length for approx token count or just batch size
                 lr = scheduler.get_last_lr()[0]
-                print(f"Step {step} | Loss: {loss.item()*acc_steps:.4f} | LR: {lr:.2e} | Tok/s: {tok_per_sec:.0f}")
+                print(f"Step {step} | Loss: {loss_accum.item():.4f} | LR: {lr:.2e} | Tok/s: {seq_per_sec:.0f}")
                 with open(os.path.join(args.log_dir, "log.txt"), "a") as f:
-                    f.write(f"{step} train {loss.item()*acc_steps:.4f} lr {lr:.2e} tok/s {tok_per_sec:.0f}\n")
+                    f.write(f"{step} train {loss_accum.item():.4f} lr {lr:.2e} tok/s {seq_per_sec:.0f}\n")
                 start_time = time.time()
                 
-            if step % args.checkpoint_interval == 0 and rank == 0:
+            if (step + 1) % args.checkpoint_interval == 0 and rank == 0:
                 save_checkpoint(model, optimizer, step, args, rank)
                 
                 # --- MONITORING TRIGGER ---
-                # Check finetune data path and valid monitor module
                 if args.finetune_data_path and monitor:
                     print(f"Step {step}: Triggering fine-tuning monitoring...")
                     finetune_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finetune.py")
-                    
-                    # Directory where model was saved
                     step_dir = os.path.join(args.checkpoint_dir, f"step_{step}")
                     history_path = os.path.join(args.log_dir, "finetune_history.csv")
                     
-                    # Call monitor.run_finetune with NEW signature
-                    metrics = monitor.run_finetune(
-                        finetune_script, 
-                        step_dir, 
-                        args.finetune_data_path, 
-                        args.log_dir, 
-                        step,
-                        model_type="maelm"
-                    )
-                    
-                    if metrics:
-                        print(f"Step {step} finetune metrics: {metrics}")
-                        monitor.update_finetune_history(history_path, step, metrics)
-                        monitor.plot_curves(os.path.join(args.log_dir, "log.txt"), history_path, args.log_dir)
-                    else:
-                        print(f"Step {step} finetune returned no metrics.")
+                    try:
+                        metrics = monitor.run_finetune(
+                            finetune_script, 
+                            step_dir, 
+                            args.finetune_data_path, 
+                            args.log_dir, 
+                            step,
+                            model_type="maelm"
+                        )
+                        
+                        if metrics:
+                            print(f"Step {step} finetune metrics: {metrics}")
+                            monitor.update_finetune_history(history_path, step, metrics)
+                            monitor.plot_curves(os.path.join(args.log_dir, "log.txt"), history_path, args.log_dir)
+                    except Exception as e:
+                        print(f"Monitoring failed: {e}")
             
             if step >= args.max_steps:
                 break

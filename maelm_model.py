@@ -113,7 +113,7 @@ class MAELMModel(nn.Module):
         # the position id is not reset / this can be implemented in various ways
         padded_encoder_position_ids = torch.zeros(batch_size, max_seen_len, device=input_ids.device).long()
         # the attention mask of the padded tokens should be zero
-        padded_encoder_attention_mask = torch.zeros(batch_size, max_seen_len, device=input_ids.device).int()
+        padded_encoder_attention_mask = torch.zeros(batch_size, max_seen_len, device=input_ids.device).to(attention_mask.dtype)
 
         # this part is compeleting the padded input_ids and attention mask and position ids without loop on the batches
         indices = torch.arange(max_seen_len, device=input_ids.device).unsqueeze(0).expand(batch_size, max_seen_len)
