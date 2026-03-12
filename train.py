@@ -4,7 +4,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import glob
 import time
-import io, numpy as np, torch, webdataset as wds
+import io
+import numpy as np
+import torch
+import webdataset as wds
 from torch import nn
 import os
 import inspect

@@ -108,8 +108,21 @@ def process_batch_mlm(batch, tokenizer, mask_ratio=0.15):
         input_ids = torch.as_tensor(input_ids)
     if not isinstance(att_mask, torch.Tensor):
         att_mask = torch.as_tensor(att_mask)
+
+    # Convert to appropriate types immediately
+    input_ids = input_ids.long()
+    att_mask = att_mask.long()
         
-    targets = input_ids.long()
+    # Validation
+    if input_ids.size(1) > 512:
+        input_ids = input_ids[:, :512]
+        att_mask = att_mask[:, :512]
+    
+    # Check for invalid tokens
+    if (input_ids >= 4096).any():
+        input_ids = torch.clamp(input_ids, max=4095)
+        
+    targets = input_ids.clone()
     att_mask = att_mask.to(dtype=torch.float32)
     
     # 5 special tokens: CLS, PAD, SEP, UNK, MASK

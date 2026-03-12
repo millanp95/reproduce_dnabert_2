@@ -12,7 +12,6 @@ print(len(tokenized_seq))
 
 import io
 import os
-import random
 from pathlib import Path
 import numpy as np
 import webdataset as wds
