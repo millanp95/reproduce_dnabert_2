@@ -55,7 +55,7 @@ def make_dataset(pattern: str, shuffle_buf: int = 10_000, resampled: bool = Fals
     ds = ds.to_tuple("__key__", "tokens", "attention_mask").map_tuple(lambda x:x, npy_decoder, npy_decoder)
     return ds
 
-def setup_data_loaders(batch_size, total_train_batch_size, train_shards_pattern, world_size, rank, device):
+def setup_data_loaders(batch_size, total_train_batch_size, train_shards_pattern, world_size, rank, device, workers=4):
     """Setup training data loader matching train.py logic"""
     assert total_train_batch_size % (batch_size * world_size) == 0
     grad_accum_steps = total_train_batch_size // (batch_size * world_size)
@@ -73,8 +73,7 @@ def setup_data_loaders(batch_size, total_train_batch_size, train_shards_pattern,
                                 world_size=world_size, rank=rank)
     
     # Use WebLoader for WebDataset
-    cpu_workers = get_num_cpu_available()
-    cpu_workers = min(cpu_workers, 4)
+    cpu_workers = workers
     
     if world_size > 1:
         # For distributed training, use WebLoader
@@ -167,6 +166,7 @@ def parse_args():
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--alibi-starting-size", type=int, default=512)
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of data loader workers")
 
     return parser.parse_known_args()[0]
 
@@ -235,7 +235,8 @@ def main():
         args.train_shards_pattern, 
         world_size, 
         rank, 
-        device
+        device,
+        workers=args.num_workers
     )
 
     tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
@@ -250,6 +251,7 @@ def main():
         "type_vocab_size": 2, 
         "_name_or_path": "zhihan1996/DNABERT-2-117M",
         "alibi_starting_size": args.alibi_starting_size,
+        "num_labels": 4096,
     })
 
     print("Initializing MAELMModel...")
@@ -279,9 +281,12 @@ def main():
             for micro_step in range(acc_steps):
                 try:
                     batch = next(train_loader)
-                except StopIteration:
+                except (StopIteration, Exception) as e:
                     if rank == 0:
-                        print("DataLoader exhausted, recreating...")
+                        print(f"DataLoader issue ({type(e).__name__}), recreating...")
+                        if isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                             time.sleep(10) # Wait a bit before retrying if transport issue
+                             
                     # Recreate loader
                     train_loader, _ = setup_data_loaders(
                         args.batch_size, args.total_batch_size, args.train_shards_pattern, world_size, rank, device
