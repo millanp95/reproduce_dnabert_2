@@ -13,12 +13,15 @@ import numpy as np
 from torch.utils.data import Dataset
 from bert_layers import BertForSequenceClassification
 
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    get_peft_model_state_dict,
-    TaskType,
-)
+try:
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        get_peft_model_state_dict,
+        TaskType,
+    )
+except ImportError:
+    pass
 
 
 @dataclass
@@ -53,7 +56,7 @@ class TrainingArguments(transformers.TrainingArguments):
     logging_steps: int = field(default=100)
     save_steps: int = field(default=100)
     eval_steps: int = field(default=100)
-    evaluation_strategy: str = field(default="steps"),
+    evaluation_strategy: str = field(default="steps")
     warmup_steps: int = field(default=50)
     weight_decay: float = field(default=0.01)
     learning_rate: float = field(default=1e-4)
@@ -66,7 +69,7 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_and_save_results: bool = field(default=True)
     save_model: bool = field(default=True)
     seed: int = field(default=42)
-    evaluation_strategy: str = "no",
+    evaluation_strategy: str = "no"
     save_strategy: str = 'no' 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -118,8 +121,26 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
 
         # load data from the disk
+        print(f"Loading data from {data_path}")
         with open(data_path, "r") as f:
-            data = list(csv.reader(f, delimiter="\t"))[1:]
+            # Check for delimiter by trying tab first
+            reader = csv.reader(f, delimiter="\t")
+            try:
+                data = list(reader)[1:]
+            except Exception as e:
+                print(f"Error reading with tab delimiter: {e}")
+                data = []
+
+        if not data or len(data[0]) <= 1:
+            # Try comma delimiter
+            print("Tab delimiter failed or single column, trying comma...")
+            with open(data_path, "r") as f:
+                reader = csv.reader(f, delimiter=",")
+                data = list(reader)[1:]
+
+        if len(data) == 0:
+            raise ValueError(f"Data file {data_path} is empty or unreadable.")
+
         if len(data[0]) == 2:
             # data is in the format of [text, label]
             logging.warning("Perform single sequence classification...")
@@ -131,13 +152,18 @@ class SupervisedDataset(Dataset):
             texts = [[d[0], d[1]] for d in data]
             labels = [int(d[2]) for d in data]
         else:
-            raise ValueError("Data format not supported.")
+            print(f"First row: {data[0]}")
+            raise ValueError("Data format not supported. Expected 2 or 3 columns (text, label) or (text1, text2, label).")
         
         if kmer != -1:
             # only write file on the first process
-            if torch.distributed.get_rank() == 0:
-                load_or_generate_kmer(data_path, texts, kmer)
-            torch.distributed.barrier()
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    load_or_generate_kmer(data_path, texts, kmer)
+                torch.distributed.barrier()
+            else:
+                 load_or_generate_kmer(data_path, texts, kmer)
+
             texts = load_or_generate_kmer(data_path, texts, kmer)
 
         output = tokenizer(
@@ -159,35 +185,104 @@ class SupervisedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         return dict(input_ids=self.input_ids[i], labels=self.labels[i], attention_mask=self.attention_mask[i])
 
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised learning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids = [instance["input_ids"] for instance in instances]
+        attention_mask = [instance["attention_mask"] for instance in instances]
+        labels = [instance["labels"] for instance in instances]
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        labels = torch.tensor(labels, dtype=torch.long)
+
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+        )
+
+"""
+Manually calculate the accuracy, f1, matthews_correlation, precision, recall with sklearn.
+"""
+def calculate_metric_with_sklearn(predictions: np.ndarray, labels: np.ndarray):
+    valid_mask = labels != -100  # Exclude padding tokens (assuming -100 is the padding token ID)
+    valid_predictions = predictions[valid_mask]
+    valid_labels = labels[valid_mask]
+    return {
+        "accuracy": sklearn.metrics.accuracy_score(valid_labels, valid_predictions),
+        "f1": sklearn.metrics.f1_score(
+            valid_labels, valid_predictions, average="macro", zero_division=0
+        ),
+        "matthews_correlation": sklearn.metrics.matthews_corrcoef(
+            valid_labels, valid_predictions
+        ),
+        "precision": sklearn.metrics.precision_score(
+            valid_labels, valid_predictions, average="macro", zero_division=0
+        ),
+        "recall": sklearn.metrics.recall_score(
+            valid_labels, valid_predictions, average="macro", zero_division=0
+        ),
+    }
+
+# from: https://discuss.huggingface.co/t/cuda-out-of-memory-when-using-trainer-with-compute-metrics/2941/13
+def preprocess_logits_for_metrics(logits:Union[torch.Tensor, Tuple[torch.Tensor, Any]], _):
+    if isinstance(logits, tuple):  # Unpack logits if it's a tuple
+        logits = logits[0]
+
+    if logits.ndim == 3:
+        # Reshape logits to 2D if needed
+        logits = logits.reshape(-1, logits.shape[-1])
+
+    return torch.argmax(logits, dim=-1)
+
+
+"""
+Compute metrics used for huggingface trainer.
+""" 
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    return calculate_metric_with_sklearn(predictions, labels)
+
+
+
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # load tokenizer
+    # Always default to valid DNABERT-2 tokenizer unless explicitly overridden with a valid tokenizer name
     if model_args.tokenizer_name:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            trust_remote_code=True,
-        )
+        tokenizer_name = model_args.tokenizer_name
     else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=True,
-            trust_remote_code=True,
-        )
+        # Fallback to base tokenizer
+        tokenizer_name = "zhihan1996/DNABERT-2-117M"
 
-    # load data
-    dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, kmer=data_args.kmer)
-    
+    print(f"Loading tokenizer from: {tokenizer_name}")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=True,
+        trust_remote_code=True,
+    )
+
+    if "InstaDeepAI" in model_args.model_name_or_path:
+        tokenizer.eos_token = tokenizer.pad_token
+
+    # define datasets and data collator
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "train.csv"), kmer=data_args.kmer)
+    val_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "dev.csv"), kmer=data_args.kmer)
+    test_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=os.path.join(data_args.data_path, "test.csv"), kmer=data_args.kmer)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
     # load model
-    num_labels = dataset.num_labels
+    num_labels = train_dataset.num_labels
     print(f"Number of labels: {num_labels}")
 
     if model_args.model_type == "maelm":
@@ -198,7 +293,7 @@ def train():
         if os.path.exists(model_args.model_name_or_path):
             config_path = model_args.model_name_or_path
         else:
-             config_path = "zhihan1996/DNABERT-2-117M" # Fallback if just loading from weights file without config.json
+            config_path = "zhihan1996/DNABERT-2-117M" # Fallback if just loading from weights file without config.json
 
         config = transformers.AutoConfig.from_pretrained(
             config_path,
@@ -241,14 +336,75 @@ def train():
             # Maybe it was already converted or saving was different
             model.load_state_dict(state_dict, strict=False)
             
+    elif model_args.model_type == "dnabert" or model_args.model_type == "bert":
+        if os.path.exists(model_args.model_name_or_path):
+            print("The model exists! ")
+            if os.path.isdir(model_args.model_name_or_path):
+                try:
+                    model = BertForSequenceClassification.from_pretrained(
+                        model_args.model_name_or_path,
+                        cache_dir=training_args.cache_dir,
+                        num_labels=num_labels,
+                        trust_remote_code=True,
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not load as HF model, creating from scratch using config: {e}")
+                    # Try to load config from the directory
+                    try:
+                        config = transformers.BertConfig.from_pretrained(model_args.model_name_or_path)
+                    except:
+                        config = transformers.BertConfig(
+                            vocab_size=4096,
+                            hidden_size=768,
+                            num_hidden_layers=12,
+                            num_attention_heads=12,
+                            max_position_embeddings=512,
+                        )
+
+                    config.num_labels = num_labels
+                    if not hasattr(config, "alibi_starting_size"):
+                        config.alibi_starting_size = 512
+                    model = BertForSequenceClassification(config)
+            else:
+                # Assuming it is a checkpoint from train.py
+                print(f"Loading from local checkpoint: {model_args.model_name_or_path}")
+                checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
+                if "config" in checkpoint:
+                    config = transformers.BertConfig.from_dict(checkpoint["config"])
+                else:
+                    config = transformers.BertConfig(
+                        vocab_size=4096,
+                        hidden_size=768,
+                        num_hidden_layers=12,
+                        num_attention_heads=12,
+                        max_position_embeddings=512,
+                        alibi_starting_size=512,
+                    )
+                config.num_labels = num_labels
+                model = BertForSequenceClassification(config)
+
+                state_dict = checkpoint.get("model_state_dict", checkpoint)
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("module."):
+                        new_state_dict[k[7:]] = v
+                    else:
+                        new_state_dict[k] = v
+
+                keys = model.load_state_dict(new_state_dict, strict=False)
+                logging.info(f"Model loaded. Missing keys: {keys.missing_keys}. Unexpected keys: {keys.unexpected_keys}")
+
+        else:
+            print("Model path not found, downloading from HF")
+            # load model
+            model = transformers.AutoModelForSequenceClassification.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                num_labels=num_labels,
+                trust_remote_code=True,
+            )
     else:
-        # Standard loading
-        model = BertForSequenceClassification.from_pretrained(
-            model_args.model_name_or_path,
-            num_labels=num_labels,
-            cache_dir=training_args.cache_dir,
-            trust_remote_code=True,
-        )
+        raise ValueError(f"Unknown model type: {model_args.model_type}")
     
     # Configure LoRA if requested
     if model_args.use_lora:
@@ -265,7 +421,16 @@ def train():
         model.print_trainable_parameters()
 
     # define trainer
-    trainer = transformers.Trainer(model=model, tokenizer=tokenizer, args=training_args, train_dataset=dataset)
+    trainer = transformers.Trainer(
+        model=model, 
+        tokenizer=tokenizer, 
+        args=training_args, 
+        data_collator=data_collator,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        compute_metrics=compute_metrics,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+    )
     trainer.train()
 
     # save model
@@ -274,10 +439,15 @@ def train():
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     # evaluate
-    if training_args.eval_and_save_results:
-        results = trainer.evaluate()
+    if training_args.eval_and_save_results and val_dataset is not None:
+        results = trainer.evaluate(eval_dataset=val_dataset)
         with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
             json.dump(results, f)
+            
+    if test_dataset is not None:
+         predictions = trainer.predict(test_dataset)
+         with open(os.path.join(training_args.output_dir, "test_results.json"), "w") as f:
+             json.dump(predictions.metrics, f)
 
 if __name__ == "__main__":
     train()
