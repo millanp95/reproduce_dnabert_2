@@ -13,6 +13,8 @@ import numpy as np
 from torch.utils.data import Dataset
 from bert_layers import BertForSequenceClassification
 
+from maelm_model import MAELMModel, MAELMForSequenceClassification
+
 try:
     from peft import (
         LoraConfig,
@@ -303,38 +305,44 @@ def train():
             trust_remote_code=True,
         )
         
-        # 2. Initialize standard classification model
-        model = BertForSequenceClassification(config)
-        
-        # 3. Load weights manually handling prefix mismatch
-        # We expect model_name_or_path to be a DIRECTORY containing pytorch_model.bin
-        # OR it can be the .bin file itself
-        if os.path.isdir(model_args.model_name_or_path):
-            ckpt_file = os.path.join(model_args.model_name_or_path, "pytorch_model.bin")
-        else:
-            ckpt_file = model_args.model_name_or_path
+        # 2. Initialize MAELM classification model
+        # Use custom MAELMForSequenceClassification
+        # This wrapper ensures encoder keys are loaded correctly and adds a classification head
+        try:
+            model = MAELMForSequenceClassification.from_pretrained(
+                model_args.model_name_or_path,
+                config=config,
+                cache_dir=training_args.cache_dir,
+                ignore_mismatched_sizes=True, 
+            )
+        except Exception as e:
+            print(f"Warning: automatic loading failed: {e}")
+            print("Attempting manual load...")
+            model = MAELMForSequenceClassification(config)
             
-        print(f"Loading weights from {ckpt_file}")
-        state_dict = torch.load(ckpt_file, map_location="cpu")
-        if "model" in state_dict: state_dict = state_dict["model"] # Handle wrapper if present
-        
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("encoder."):
-                new_key = k.replace("encoder.", "bert.")
-                new_state_dict[new_key] = v
-            elif k.startswith("classifier."): # If resuming finetuning
-                new_state_dict[k] = v
-            # Ignore decoder.
+            if os.path.isdir(model_args.model_name_or_path):
+                ckpt_file = os.path.join(model_args.model_name_or_path, "pytorch_model.bin")
+            else:
+                ckpt_file = model_args.model_name_or_path
                 
-        # Load
-        if new_state_dict:
-            missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-            print(f"MAELM Load | Missing: {len(missing)} | Unexpected: {len(unexpected)}")
-        else:
-            print("Warning: No 'encoder.' keys found in checkpoint. Trying direct load...")
-            # Maybe it was already converted or saving was different
-            model.load_state_dict(state_dict, strict=False)
+            if os.path.exists(ckpt_file):
+                print(f"Loading weights manually from {ckpt_file}")
+                state_dict = torch.load(ckpt_file, map_location="cpu")
+                if "model" in state_dict: state_dict = state_dict["model"]
+                
+                # Check for 'encoder.' keys (MAELM format) vs 'bert.' keys (DNABERT format)
+                # MAELMForSequenceClassification uses 'encoder', so if checkpoint has 'bert', rename.
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("bert."):
+                        new_state_dict[k.replace("bert.", "encoder.")] = v
+                    else:
+                        new_state_dict[k] = v
+                        
+                missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+                print(f"Manual Load | Missing: {len(missing)} | Unexpected: {len(unexpected)}")
+            else:
+                print(f"Checkpoint file not found at {ckpt_file}, using random initialization based on config.")
             
     elif model_args.model_type == "dnabert" or model_args.model_type == "bert":
         if os.path.exists(model_args.model_name_or_path):
@@ -441,12 +449,12 @@ def train():
     # evaluate
     if training_args.eval_and_save_results and val_dataset is not None:
         results = trainer.evaluate(eval_dataset=val_dataset)
-        with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir,training_args.run_name,"eval_results.json"), "w") as f:
             json.dump(results, f)
             
     if test_dataset is not None:
          predictions = trainer.predict(test_dataset)
-         with open(os.path.join(training_args.output_dir, "test_results.json"), "w") as f:
+         with open(os.path.join(training_args.output_dir,training_args.run_name,"test_results.json"), "w") as f:
              json.dump(predictions.metrics, f)
 
 if __name__ == "__main__":
