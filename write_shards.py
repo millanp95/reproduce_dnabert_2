@@ -4,7 +4,7 @@ import transformers
 
 import webdataset as wds
 from transformers import AutoTokenizer, AutoModel
-tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, max_len=128)
+tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, max_len=512)
 
 
 tokenized_seq = tokenizer("ACGT", padding='max_length')['input_ids']
@@ -43,16 +43,13 @@ def process_line(args):
         "attention_mask": npy_to_bytes(mask),
     }
 
-def write_shards(input_file, out_dir, split_name, target_shard_size_bytes=1e9, max_samples_per_shard=300000, num_workers=8, ratio=1.0):
+def write_shards(input_file, out_dir, split_name, target_shard_size_bytes=1e9, max_samples_per_shard=300000, num_workers=8):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     pattern = os.path.join(out_dir, f"{split_name}-%06d.tar")
     sink = wds.ShardWriter(pattern, maxsize=target_shard_size_bytes, maxcount=max_samples_per_shard)
 
     with open(input_file) as f, Pool(num_workers) as pool, tqdm(desc=f"Writing {split_name} shards") as pbar:
         for idx, line in enumerate(f):
-            if random.random() > ratio:
-                pbar.update(1)
-                continue
             args = (line, split_name, idx)
             record = pool.apply(process_line, (args,))
             sink.write(record)
@@ -66,9 +63,6 @@ cpu_count = os.cpu_count()
 
 print(f"Number of available CPU cores: {cpu_count}")
 
-RATIO = 0.25
-output_dir = f"shards_{RATIO}"
-
-write_shards("data/dev.txt", output_dir, "dev", ratio=RATIO)
-write_shards("data/train.txt", output_dir, "train",
-max_samples_per_shard=600000, num_workers=8, ratio=RATIO)
+write_shards("data/dev.txt", "shards", "dev")
+write_shards("data/train.txt", "shards", "train",
+max_samples_per_shard=600000, num_workers=8)
