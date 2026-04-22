@@ -63,21 +63,22 @@ echo "Date: $(date)"
 echo "------------------------------------------------------"
 
 # --- Training Command ---
-# running train_maelm.py
+# running main_train.py
 
 torchrun --nproc_per_node=1 \
          --nnodes=1 \
          --node_rank=0 \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
-         train_maelm.py \
+         main_train.py \
+         --architecture maelm \
          --batch-size 64 \
          --total-batch-size 4096 \
          --max-steps 500000 \
          --checkpoint-interval 2000 \
          --checkpoint-dir "$CHECKPOINT_DIR" \
          --log-dir "$LOG_DIR" \
-         --learning-rate 5e-4 \
+         --max-lr 5e-4 \
          --warmup-steps 30000 \
          --weight-decay 0.1 \
          --finetune-data-path "$FINETUNE_DATA"
