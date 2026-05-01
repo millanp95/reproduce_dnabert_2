@@ -377,7 +377,9 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
     original_model = model
 
     if config.use_compile:
-        model = torch.compile(model, mode=config.compile_mode)
+        # dynamic=True is required for MAE models where sequence length varies
+        # per batch due to masking (encoder only sees unmasked tokens)
+        model = torch.compile(model, mode=config.compile_mode, dynamic=True)
 
     if ddp:
         find_unused = config.architecture == "maelm"

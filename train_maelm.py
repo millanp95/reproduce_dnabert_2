@@ -454,7 +454,7 @@ def main():
     if not args.no_compile:
         if rank == 0:
             print(f"Compiling model with torch.compile (mode={args.compile_mode})...")
-        raw_model = torch.compile(raw_model, mode=args.compile_mode)
+        raw_model = torch.compile(raw_model, mode=args.compile_mode, dynamic=True)
 
     model = raw_model
 
