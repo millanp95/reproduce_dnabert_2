@@ -57,10 +57,16 @@ except ImportError:
 try:
     from barcodebert.maelm_model import MAELMModel as BarcodeMAELMModel
     from barcodebert.jumbo_taxonomy_classifier import compute_taxonomy_classification_loss
+    from barcodebert.cls_taxonomy_classifier import (
+        CLSTaxonomyClassifier,
+        compute_cls_taxonomy_classification_loss,
+    )
     BARCODEBERT_AVAILABLE = True
 except ImportError:
     BarcodeMAELMModel = None
     compute_taxonomy_classification_loss = None
+    CLSTaxonomyClassifier = None
+    compute_cls_taxonomy_classification_loss = None
     BARCODEBERT_AVAILABLE = False
 
 import monitor
@@ -104,6 +110,9 @@ class TrainingConfig:
     share_jumbo_layers: bool = True
     cls_loss_weight: float = 1.0
     species_vocab: Optional[str] = None
+
+    # Standard CLS token + taxonomy
+    use_cls_token: bool = False
 
     # Balanced sampling (streaming KClassMSample equivalent)
     k_classes: int = 0                  # 0 = disabled
@@ -339,37 +348,86 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
         num_labels=config.vocab_size,
     )
 
-    encoder_config = BertConfig(**{**base_cfg,
-                                   "num_hidden_layers": config.n_layers,
-                                   "num_attention_heads": config.n_heads})
-    decoder_config = BertConfig(**{**base_cfg,
-                                   "num_hidden_layers": dec_n_layers,
-                                   "num_attention_heads": dec_n_heads})
-
-    if config.architecture == "bert":
-        from bert_layers import BertForMaskedLM
-        model = BertForMaskedLM(encoder_config)
-
-    elif config.architecture == "maelm" and config.jumbo:
+    if config.architecture == "bert" and config.jumbo:
         if not BARCODEBERT_AVAILABLE:
             raise RuntimeError("barcodebert package not found. Run `pip install -e .` from BarcodeMAE/.")
+        from barcodebert.jumbo_transformer_with_taxonomy import create_jumbo_transformer_with_taxonomy
+        encoder_config = BertConfig(**{**base_cfg, "num_hidden_layers": 12, "num_attention_heads": 12})
+        model = create_jumbo_transformer_with_taxonomy(
+            encoder_config,
+            jumbo_multiplier=config.jumbo_multiplier,
+            share_jumbo_mlp_across_layers=config.share_jumbo_layers,
+            enable_taxonomy_classification=(config.species_vocab is not None),
+            mlp_expansion_factor=config.jumbo_mlp_expansion,
+        )
+        model.enable_genus_classification = (config.species_vocab is not None)
+
+    elif config.architecture == "bert" and config.use_cls_token:
+        # BERT-base + standard CLS token taxonomy head
+        if not BARCODEBERT_AVAILABLE:
+            raise RuntimeError("barcodebert package not found. Run `pip install -e .` from BarcodeMAE/.")
+        encoder_config = BertConfig(**{**base_cfg, "num_hidden_layers": 12, "num_attention_heads": 12})
+        from bert_layers import BertForMaskedLM
+        model = BertForMaskedLM(encoder_config)
         num_species = None
         if config.species_vocab:
             with open(config.species_vocab) as f:
                 num_species = len(json.load(f))
-        model = BarcodeMAELMModel(
-            encoder_config=encoder_config,
-            decoder_config=decoder_config,
-            jumbo=True,
-            jumbo_multiplier=config.jumbo_multiplier,
-            share_jumbo_layers=config.share_jumbo_layers,
-            enable_genus_classification=(num_species is not None),
-            mlp_expansion_factor=config.jumbo_mlp_expansion,
-        )
+        model.taxonomy_classifier = CLSTaxonomyClassifier(
+            hidden_dim=encoder_config.hidden_size
+        ) if num_species is not None else None
+        model.enable_genus_classification = num_species is not None
+
+    elif config.architecture == "bert":
+        # BERT-base: fixed at 12L/12H/768/3072 — not configurable via CLI
+        encoder_config = BertConfig(**{**base_cfg, "num_hidden_layers": 12, "num_attention_heads": 12})
+        from bert_layers import BertForMaskedLM
+        model = BertForMaskedLM(encoder_config)
 
     elif config.architecture == "maelm":
-        from maelm_model import MAELMModel
-        model = MAELMModel(encoder_config, decoder_config)
+        encoder_config = BertConfig(**{**base_cfg,
+                                       "num_hidden_layers": config.n_layers,
+                                       "num_attention_heads": config.n_heads})
+        decoder_config = BertConfig(**{**base_cfg,
+                                       "num_hidden_layers": dec_n_layers,
+                                       "num_attention_heads": dec_n_heads})
+
+        num_species = None
+        if config.species_vocab:
+            with open(config.species_vocab) as f:
+                num_species = len(json.load(f))
+
+        if config.jumbo:
+            if not BARCODEBERT_AVAILABLE:
+                raise RuntimeError("barcodebert package not found. Run `pip install -e .` from BarcodeMAE/.")
+            model = BarcodeMAELMModel(
+                encoder_config=encoder_config,
+                decoder_config=decoder_config,
+                jumbo=True,
+                jumbo_multiplier=config.jumbo_multiplier,
+                share_jumbo_layers=config.share_jumbo_layers,
+                enable_genus_classification=(num_species is not None),
+                mlp_expansion_factor=config.jumbo_mlp_expansion,
+            )
+        elif config.use_cls_token:
+            if not BARCODEBERT_AVAILABLE:
+                raise RuntimeError("barcodebert package not found. Run `pip install -e .` from BarcodeMAE/.")
+            model = BarcodeMAELMModel(
+                encoder_config=encoder_config,
+                decoder_config=decoder_config,
+                jumbo=False,
+                jumbo_multiplier=1,
+                share_jumbo_layers=False,
+                enable_genus_classification=False,
+                use_cls_token=True,
+            )
+            model.taxonomy_classifier = CLSTaxonomyClassifier(
+                hidden_dim=encoder_config.hidden_size
+            ) if num_species is not None else None
+            model.enable_genus_classification = num_species is not None
+        else:
+            from maelm_model import MAELMModel
+            model = MAELMModel(encoder_config, decoder_config)
 
     else:
         raise ValueError(f"Unknown architecture: {config.architecture}")
@@ -699,7 +757,49 @@ def train(config: TrainingConfig):
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                if config.architecture == "bert":
+                if config.architecture == "bert" and config.jumbo:
+                    # BERT encoder + Jumbo CLS + taxonomy head
+                    outputs = model(input_ids=masked_input, attention_mask=att_mask)
+                    masked_idx = masked_input == config.mask_token_id
+                    loss = criterion(
+                        outputs.logits.view(-1, config.vocab_size)[masked_idx.view(-1)],
+                        targets.view(-1)[masked_idx.view(-1)],
+                    ) if masked_idx.any() else outputs.logits.new_tensor(0.0)
+                    _raw = model.module if hasattr(model, "module") else original_model
+                    if _raw.enable_genus_classification and outputs.jumbo_tokens is not None:
+                        tax_loss, _, _, n_same, n_diff = compute_taxonomy_classification_loss(
+                            outputs.jumbo_tokens, species_labels, _raw.taxonomy_classifier,
+                            same_ratio=0.5, max_pairs=32, debug_print=False,
+                        )
+                        num_pos_pairs += n_same
+                        num_neg_pairs += n_diff
+                        if tax_loss is not None:
+                            tax_loss_accum += tax_loss.detach() / grad_accum_steps
+                            loss = loss + config.cls_loss_weight * tax_loss
+
+                elif config.architecture == "bert" and config.use_cls_token:
+                    output = model(masked_input, attention_mask=att_mask, output_hidden_states=True)
+                    masked_idx = masked_input == config.mask_token_id
+                    loss = criterion(
+                        output.logits.view(-1, config.vocab_size)[masked_idx.view(-1)],
+                        targets.view(-1)[masked_idx.view(-1)],
+                    ) if masked_idx.any() else output.logits.new_tensor(0.0)
+                    _raw = model.module if hasattr(model, "module") else original_model
+                    if _raw.enable_genus_classification and _raw.taxonomy_classifier is not None:
+                        hs = output.hidden_states
+                        if isinstance(hs, tuple):
+                            hs = hs[-1]
+                        tax_loss, _, _, n_same, n_diff = compute_cls_taxonomy_classification_loss(
+                            hs, species_labels, _raw.taxonomy_classifier,
+                            same_ratio=0.5, max_pairs=32, debug_print=False,
+                        )
+                        num_pos_pairs += n_same
+                        num_neg_pairs += n_diff
+                        if tax_loss is not None:
+                            tax_loss_accum += tax_loss.detach() / grad_accum_steps
+                            loss = loss + config.cls_loss_weight * tax_loss
+
+                elif config.architecture == "bert":
                     output = model(masked_input, attention_mask=att_mask)
                     masked_idx = masked_input == config.mask_token_id
                     loss = criterion(
@@ -718,13 +818,34 @@ def train(config: TrainingConfig):
                     if _raw.enable_genus_classification and outputs.jumbo_tokens is not None:
                         tax_loss, _, _, n_same, n_diff = compute_taxonomy_classification_loss(
                             outputs.jumbo_tokens, species_labels, _raw.taxonomy_classifier,
-                            same_ratio=0.5, max_pairs=64, debug_print=False,
+                            same_ratio=0.5, max_pairs=32, debug_print=False,
                         )
                         num_pos_pairs += n_same
                         num_neg_pairs += n_diff
                         if tax_loss is not None:
                             tax_loss_accum += tax_loss.detach() / grad_accum_steps
                             loss = loss + config.cls_loss_weight * tax_loss
+
+                elif config.use_cls_token:  # maelm + CLS taxonomy
+                    outputs = model(input_ids=masked_input, attention_mask=att_mask,
+                                    mask_positions=mask_positions)
+                    loss = F.cross_entropy(
+                        outputs.logits.view(-1, dnabert_config.vocab_size)[mask_positions.view(-1)],
+                        targets.view(-1)[mask_positions.view(-1)],
+                    )
+                    _raw = model.module if hasattr(model, "module") else original_model
+                    if _raw.enable_genus_classification and _raw.taxonomy_classifier is not None:
+                        cls_hidden = getattr(outputs, "cls_token", None)
+                        if cls_hidden is not None:
+                            tax_loss, _, _, n_same, n_diff = compute_cls_taxonomy_classification_loss(
+                                cls_hidden, species_labels, _raw.taxonomy_classifier,
+                                same_ratio=0.5, max_pairs=32, debug_print=False,
+                            )
+                            num_pos_pairs += n_same
+                            num_neg_pairs += n_diff
+                            if tax_loss is not None:
+                                tax_loss_accum += tax_loss.detach() / grad_accum_steps
+                                loss = loss + config.cls_loss_weight * tax_loss
 
                 else:  # basic maelm
                     output = model(input_ids=masked_input, attention_mask=att_mask,
@@ -850,6 +971,9 @@ def parse_args():
     parser.add_argument("--species-vocab", type=str, default=None)
 
     # Balanced sampling
+    parser.add_argument("--use-cls-token", action="store_true", default=False,
+                        help="Use standard CLS token taxonomy head instead of Jumbo tokens")
+
     parser.add_argument("--k-classes", type=int, default=0,
                         help="Species per balanced block (0=disabled). k=32 + --m-per-class=2 → 32 positive pairs")
     parser.add_argument("--m-per-class", type=int, default=2)
@@ -910,6 +1034,7 @@ def main():
         share_jumbo_layers=args.share_jumbo_layers,
         cls_loss_weight=args.cls_loss_weight,
         species_vocab=args.species_vocab,
+        use_cls_token=args.use_cls_token,
         k_classes=args.k_classes,
         m_per_class=args.m_per_class,
         checkpoint_interval=args.checkpoint_interval,
