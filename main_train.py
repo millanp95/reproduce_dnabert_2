@@ -858,7 +858,7 @@ def train(config: TrainingConfig):
             loss_accum += loss.detach()
             loss.backward()
 
-        if ddp:
+        if ddp and world_size > 1:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -917,7 +917,7 @@ def train(config: TrainingConfig):
                     monitor.plot_curves(log_file, history_path, config.log_dir)
                     maybe_log_wandb({f"finetune/{k}": v for k, v in metrics.items()}, step, wandb_run)
 
-        if ddp and ((step + 1) % config.checkpoint_interval == 0 or last_step):
+        if ddp and world_size > 1 and ((step + 1) % config.checkpoint_interval == 0 or last_step):
             dist.barrier()
 
     if wandb_run is not None:
