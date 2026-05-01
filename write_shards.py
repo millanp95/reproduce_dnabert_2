@@ -11,7 +11,7 @@ import webdataset as wds
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-MAX_LENGTH = 192 # the average is 198 the Scots's suggestion was either 192 ro 224
+MAX_LENGTH = 224
 
 tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
 tokenizer.model_max_length = MAX_LENGTH
@@ -139,7 +139,7 @@ def write_shards(
 cpu_count = os.cpu_count()
 print(f"Number of available CPU cores: {cpu_count}")
 
-CONFIDENCE_THRESHOLD = 0.0  # include all classified sequences regardless of confidence
+CONFIDENCE_THRESHOLD = 25.0  # only trust Kraken2 assignments with confidence > 25%
 RATIO = 0.01
 
 BASE_DATA_DIR = "/home/m4safari/projects/def-lila-ab/m4safari/shards_data/BarcodeMAE/reproduce_dnabert_2/reproduce_dnabert_2"

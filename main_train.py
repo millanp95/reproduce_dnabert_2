@@ -761,7 +761,9 @@ def train(config: TrainingConfig):
             loss_val = loss_accum.item()
             norm_val = norm.item() if isinstance(norm, torch.Tensor) else float(norm)
 
-            tax_str = (f" | TaxLoss: {tax_loss_accum.item():.4f} | Pairs: {num_pos_pairs}pos/{num_neg_pairs}neg"
+            avg_pos = num_pos_pairs // grad_accum_steps
+            avg_neg = num_neg_pairs // grad_accum_steps
+            tax_str = (f" | TaxLoss: {tax_loss_accum.item():.4f} | Pairs: {avg_pos}pos/{avg_neg}neg"
                        if isinstance(tax_loss_accum, torch.Tensor) else "")
 
             print(f"step {step:5d} | loss: {loss_val:.4f}{tax_str} | "
