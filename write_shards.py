@@ -11,7 +11,7 @@ import webdataset as wds
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-MAX_LENGTH = 224
+MAX_LENGTH = 192 # the average is 198 the Scots's suggestion was either 192 ro 224
 
 tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
 tokenizer.model_max_length = MAX_LENGTH
