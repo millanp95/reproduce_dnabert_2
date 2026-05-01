@@ -388,10 +388,6 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
     elif config.use_compile and config.jumbo:
         print("Note: torch.compile disabled for Jumbo MAE (dynamic shapes incompatible)")
 
-    if ddp and world_size > 1:
-        find_unused = config.architecture == "maelm"
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=find_unused)
-
     return model, original_model, encoder_config
 
 
@@ -638,6 +634,9 @@ def train(config: TrainingConfig):
 
     # Model
     model, original_model, dnabert_config = create_model(config, device, ddp, local_rank)
+    if ddp and world_size > 1:
+        find_unused = config.architecture == "maelm"
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=find_unused)
 
     if master:
         enc_l = config.n_layers
