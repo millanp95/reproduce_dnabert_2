@@ -326,7 +326,9 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
         initializer_range=0.02,
         intermediate_size=3072,
         layer_norm_eps=1e-12,
-        max_position_embeddings=config.max_seq_length,
+        # Decoder sees max_seq_length + jumbo_multiplier tokens; set buffer large enough.
+        # ALiBi models don't use position embeddings, so this is only a buffer size.
+        max_position_embeddings=config.max_seq_length + config.jumbo_multiplier + 8,
         position_embedding_type="absolute",
         torch_dtype="float32",
         transformers_version="4.29.0",
