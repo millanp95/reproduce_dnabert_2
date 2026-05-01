@@ -454,7 +454,10 @@ def main():
     if not args.no_compile:
         if rank == 0:
             print(f"Compiling model with torch.compile (mode={args.compile_mode})...")
-        raw_model = torch.compile(raw_model, mode=args.compile_mode, dynamic=True)
+        if args.jumbo:
+            print("Note: torch.compile disabled for Jumbo MAE (dynamic shapes incompatible)")
+        else:
+            raw_model = torch.compile(raw_model, mode=args.compile_mode)
 
     model = raw_model
 

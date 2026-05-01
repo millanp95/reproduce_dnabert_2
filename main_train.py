@@ -376,10 +376,14 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
     # Keep a reference to the uncompiled model for attribute access
     original_model = model
 
-    if config.use_compile:
-        # dynamic=True is required for MAE models where sequence length varies
-        # per batch due to masking (encoder only sees unmasked tokens)
-        model = torch.compile(model, mode=config.compile_mode, dynamic=True)
+    # torch.compile is incompatible with Jumbo MAE: the model uses integer
+    # attributes (jumbo_multiplier) in tensor ops and has dynamic sequence
+    # lengths from masking — both break dynamo's symbolic shape tracing.
+    can_compile = config.use_compile and not config.jumbo
+    if can_compile:
+        model = torch.compile(model, mode=config.compile_mode)
+    elif config.use_compile and config.jumbo:
+        print("Note: torch.compile disabled for Jumbo MAE (dynamic shapes incompatible)")
 
     if ddp:
         find_unused = config.architecture == "maelm"
