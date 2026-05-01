@@ -24,6 +24,7 @@ Quick usage
 """
 
 import argparse
+import contextlib
 import datetime
 import glob
 import inspect
@@ -387,7 +388,7 @@ def create_model(config: TrainingConfig, device: str, ddp: bool, ddp_local_rank:
     elif config.use_compile and config.jumbo:
         print("Note: torch.compile disabled for Jumbo MAE (dynamic shapes incompatible)")
 
-    if ddp:
+    if ddp and world_size > 1:
         find_unused = config.architecture == "maelm"
         model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=find_unused)
 
