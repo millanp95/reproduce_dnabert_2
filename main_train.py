@@ -718,7 +718,7 @@ def train(config: TrainingConfig):
                     if _raw.enable_genus_classification and outputs.jumbo_tokens is not None:
                         tax_loss, _, _, n_same, n_diff = compute_taxonomy_classification_loss(
                             outputs.jumbo_tokens, species_labels, _raw.taxonomy_classifier,
-                            same_ratio=0.5, max_pairs=32, debug_print=False,
+                            same_ratio=0.5, max_pairs=64, debug_print=False,
                         )
                         num_pos_pairs += n_same
                         num_neg_pairs += n_diff

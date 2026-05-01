@@ -91,7 +91,7 @@ torchrun --nproc_per_node=1 \
          --jumbo-multiplier 6 \
          --jumbo-mlp-expansion 2 \
          --share-jumbo-layers \
-         --cls-loss-weight 1.0 \
+         --cls-loss-weight 0.01 \
          --species-vocab "$SPECIES_VOCAB" \
          \
          --k-classes 32 \
