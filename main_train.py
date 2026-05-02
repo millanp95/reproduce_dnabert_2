@@ -778,17 +778,17 @@ def train(config: TrainingConfig):
                             loss = loss + config.cls_loss_weight * tax_loss
 
                 elif config.architecture == "bert" and config.use_cls_token:
-                    output = model(masked_input, attention_mask=att_mask, output_hidden_states=True)
+                    # bert_layers.py hardcodes hidden_states=None in output, so we
+                    # call the BERT encoder and MLM head separately to get both.
+                    _raw = model.module if hasattr(model, "module") else original_model
+                    hs = _raw.bert(masked_input, attention_mask=att_mask)[0]  # (B, N, D)
+                    logits = _raw.cls(hs)                                      # (B, N, vocab)
                     masked_idx = masked_input == config.mask_token_id
                     loss = criterion(
-                        output.logits.view(-1, config.vocab_size)[masked_idx.view(-1)],
+                        logits.view(-1, config.vocab_size)[masked_idx.view(-1)],
                         targets.view(-1)[masked_idx.view(-1)],
-                    ) if masked_idx.any() else output.logits.new_tensor(0.0)
-                    _raw = model.module if hasattr(model, "module") else original_model
+                    ) if masked_idx.any() else logits.new_tensor(0.0)
                     if _raw.enable_genus_classification and _raw.taxonomy_classifier is not None:
-                        hs = output.hidden_states
-                        if isinstance(hs, tuple):
-                            hs = hs[-1]
                         tax_loss, _, _, n_same, n_diff = compute_cls_taxonomy_classification_loss(
                             hs, species_labels, _raw.taxonomy_classifier,
                             same_ratio=0.5, max_pairs=32, debug_print=False,
